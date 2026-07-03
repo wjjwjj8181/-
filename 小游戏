@@ -1,0 +1,1337 @@
+"""
+塔防游戏 - Tower Defense (Image Edition)
+========================================
+像素艺术风格的塔防游戏，敌人使用 AI 生成的精灵图。
+
+操作说明:
+  - 鼠标点击右侧面板选择防御塔类型
+  - 鼠标点击地图空白格子放置防御塔
+  - 点击"开始波次"按钮开始下一波敌人
+  - 点击已放置的塔可查看信息和升级
+  - 按 P 键暂停/继续
+  - 按 ESC 退出游戏
+"""
+
+import pygame
+import math
+import random
+import struct
+import io
+import wave
+import sys
+import os
+from collections import deque
+
+# ============================================================
+# 初始化 Pygame
+# ============================================================
+pygame.init()
+pygame.mixer.init()
+
+# ============================================================
+# 常量定义
+# ============================================================
+GRID_SIZE = 40          # 每个格子的像素大小
+GRID_COLS = 20          # 地图列数
+GRID_ROWS = 15          # 地图行数
+PANEL_WIDTH = 220       # 右侧信息面板宽度
+MAP_WIDTH = GRID_COLS * GRID_SIZE   # 800
+MAP_HEIGHT = GRID_ROWS * GRID_SIZE  # 600
+WINDOW_WIDTH = MAP_WIDTH + PANEL_WIDTH
+WINDOW_HEIGHT = MAP_HEIGHT
+FPS = 60
+
+# 资源目录
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
+
+# 颜色定义
+COLOR_BG = (34, 40, 49)
+COLOR_GRID = (45, 52, 61)
+COLOR_PATH = (57, 62, 70)
+COLOR_PATH_BORDER = (78, 84, 92)
+COLOR_PANEL_BG = (24, 28, 36)
+COLOR_GOLD = (255, 215, 0)
+COLOR_HEART = (255, 80, 80)
+COLOR_WHITE = (238, 238, 238)
+COLOR_GREEN = (0, 230, 118)
+COLOR_RED = (255, 60, 60)
+COLOR_BLUE = (64, 160, 255)
+COLOR_ICE = (0, 220, 255)
+COLOR_PURPLE = (180, 100, 255)
+COLOR_ORANGE = (255, 160, 50)
+COLOR_BUTTON = (60, 70, 90)
+COLOR_BUTTON_HOVER = (80, 95, 120)
+COLOR_BUTTON_ACTIVE = (100, 120, 160)
+COLOR_BLACK = (20, 20, 20)
+COLOR_TOWER_RANGE_BG = (255, 255, 255, 40)
+COLOR_WAVE_BAR_BG = (40, 45, 55)
+
+# 敌人路径 (网格坐标)
+PATH_POINTS = [
+    (0, 7), (3, 7), (3, 3), (7, 3), (7, 10), (11, 10),
+    (11, 5), (15, 5), (15, 8), (19, 8)
+]
+
+# ============================================================
+# 资源加载系统
+# ============================================================
+class AssetManager:
+    """管理所有游戏资源的加载和缓存"""
+    def __init__(self):
+        self.textures = {}
+        self.sprites = {}
+        self._loaded = False
+
+    def load_all(self):
+        if self._loaded:
+            return
+        self._loaded = True
+        self._load_textures()
+        self._load_sprites()
+
+    def _load_textures(self):
+        """加载背景纹理"""
+        try:
+            grass = pygame.image.load(os.path.join(ASSETS_DIR,
+                "A_seamless_tileable_grass_text_2026-07-03T01-26-29.png")).convert()
+            self.textures["grass"] = grass
+        except Exception as e:
+            print(f"Grass texture not found: {e}")
+            self.textures["grass"] = None
+
+        try:
+            stone = pygame.image.load(os.path.join(ASSETS_DIR,
+                "A_seamless_tileable_stone_dirt_2026-07-03T01-31-56.png")).convert()
+            self.textures["stone"] = stone
+        except Exception as e:
+            print(f"Stone texture not found: {e}")
+            self.textures["stone"] = None
+
+    def _load_sprites(self):
+        """加载并裁剪精灵图"""
+        # ---- 敌人精灵 ----
+        # 优先使用抠图处理后的透明背景版本
+        enemy_sheet_name = "A_pixel_art_sprite_sheet_for_a_2026-07-03T01-26-29_透明背景.png"
+        enemy_path = os.path.join(ASSETS_DIR, enemy_sheet_name)
+        if not os.path.exists(enemy_path):
+            enemy_path = os.path.join(ASSETS_DIR,
+                "A_pixel_art_sprite_sheet_for_a_2026-07-03T01-26-29.png")
+        try:
+            enemy_sheet = pygame.image.load(enemy_path).convert_alpha()
+            # 自动检测每个精灵在 sheet 中的边界框
+            enemy_boxes = self._detect_sprite_boxes(enemy_sheet, count=4)
+            for i, (x, y, w, h) in enumerate(enemy_boxes):
+                rect = pygame.Rect(x, y, w, h)
+                sprite = enemy_sheet.subsurface(rect).copy()
+                self.sprites[f"enemy_{i}"] = sprite
+        except Exception as e:
+            print(f"Enemy sprites not found: {e}")
+
+        # ---- 防御塔精灵 ----
+        tower_sheet_name = "A_pixel_art_sprite_sheet_for_t_2026-07-03T01-26-29_透明背景.png"
+        tower_path = os.path.join(ASSETS_DIR, tower_sheet_name)
+        if not os.path.exists(tower_path):
+            tower_path = os.path.join(ASSETS_DIR,
+                "A_pixel_art_sprite_sheet_for_t_2026-07-03T01-26-29.png")
+        try:
+            tower_sheet = pygame.image.load(tower_path).convert_alpha()
+            # 自动检测每个精灵在 sheet 中的边界框
+            tower_boxes = self._detect_sprite_boxes(tower_sheet, count=4)
+            tower_names = ["archer", "cannon", "magic", "ice"]
+            for j, (x, y, w, h) in enumerate(tower_boxes):
+                rect = pygame.Rect(x, y, w, h)
+                sprite = tower_sheet.subsurface(rect).copy()
+                self.sprites[f"tower_{tower_names[j]}"] = sprite
+        except Exception as e:
+            print(f"Tower sprites not found: {e}")
+
+    def _detect_sprite_boxes(self, surface, count=4):
+        """自动检测精灵图中的连通分量边界框"""
+        w, h = surface.get_width(), surface.get_height()
+
+        # 创建透明度遮罩 (alpha > 30 = 有效像素)
+        mask = [[surface.get_at((x, y)).a > 30 for y in range(h)] for x in range(w)]
+
+        # BFS 连通分量检测
+        visited = [[False for _ in range(h)] for _ in range(w)]
+        boxes = []
+
+        for x in range(w):
+            for y in range(h):
+                if mask[x][y] and not visited[x][y]:
+                    q = deque([(x, y)])
+                    visited[x][y] = True
+                    min_x, max_x = x, x
+                    min_y, max_y = y, y
+                    while q:
+                        cx, cy = q.popleft()
+                        min_x = min(min_x, cx); max_x = max(max_x, cx)
+                        min_y = min(min_y, cy); max_y = max(max_y, cy)
+                        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                                       (-1, -1), (1, -1), (-1, 1), (1, 1)]:
+                            nx, ny = cx + dx, cy + dy
+                            if 0 <= nx < w and 0 <= ny < h and mask[nx][ny] and not visited[nx][ny]:
+                                visited[nx][ny] = True
+                                q.append((nx, ny))
+                    bw, bh = max_x - min_x + 1, max_y - min_y + 1
+                    # 过滤条件：
+                    # 1. 不能是占据全图边缘的半透明残留（>90% 宽或高）
+                    # 2. 不能太小的噪点（至少 50px 宽高）
+                    is_full_edge = (bw > w * 0.9 or bh > h * 0.9)
+                    is_too_small = (bw < 50 or bh < 50)
+                    if not is_full_edge and not is_too_small:
+                        boxes.append((min_x, min_y, bw, bh))
+
+        # 按位置排序：先按行分组(y)，再按列(x)排序
+        if boxes:
+            row_threshold = h // 2
+            boxes.sort(key=lambda b: (b[1] // row_threshold, b[0]))
+
+        return boxes[:count]
+
+    def get_texture(self, name):
+        return self.textures.get(name)
+
+    def get_sprite(self, name):
+        return self.sprites.get(name)
+
+    def has_sprite(self, name):
+        return name in self.sprites
+
+
+ASSETS = AssetManager()
+
+
+# ============================================================
+# 音效生成器
+# ============================================================
+def generate_sound(frequency, duration, volume=0.4, sample_rate=22050,
+                   wave_type="sine", freq_end=None, attack=0.01):
+    """用数学函数生成音效，返回 pygame.mixer.Sound 对象"""
+    n_samples = int(sample_rate * duration)
+    buf = io.BytesIO()
+    with wave.open(buf, 'w') as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        samples = []
+        for i in range(n_samples):
+            t = i / sample_rate
+            progress = i / n_samples
+            # ADSR-like envelope
+            env_attack = min(1.0, t / attack) if attack > 0 else 1.0
+            env_decay = max(0.0, 1.0 - progress ** 1.5)
+            envelope = env_attack * env_decay * volume
+            current_freq = frequency
+            if freq_end:
+                current_freq = frequency + (freq_end - frequency) * progress
+            if wave_type == "square":
+                val = 1.0 if math.sin(2 * math.pi * current_freq * t) > 0 else -1.0
+            elif wave_type == "sawtooth":
+                val = 2.0 * (current_freq * t % 1.0) - 1.0
+            elif wave_type == "noise":
+                val = random.uniform(-1.0, 1.0)
+            else:  # sine
+                val = math.sin(2 * math.pi * current_freq * t)
+            sample = int(envelope * val * 32767)
+            samples.append(struct.pack('<h', max(-32768, min(32767, sample))))
+        f.writeframesraw(b''.join(samples))
+    buf.seek(0)
+    return pygame.mixer.Sound(buf)
+
+
+# 预生成所有音效
+SOUND_SHOOT_ARROW = generate_sound(800, 0.08, 0.3, wave_type="sine", freq_end=400)
+SOUND_SHOOT_CANNON = generate_sound(120, 0.25, 0.5, wave_type="square", freq_end=60)
+SOUND_SHOOT_ICE = generate_sound(2000, 0.12, 0.25, wave_type="sine", freq_end=800)
+SOUND_SHOOT_MAGIC = generate_sound(600, 0.2, 0.3, wave_type="sawtooth", freq_end=1200)
+SOUND_HIT = generate_sound(300, 0.06, 0.3, wave_type="noise")
+SOUND_DEATH = generate_sound(200, 0.2, 0.4, wave_type="square", freq_end=60)
+SOUND_WAVE_START = generate_sound(440, 0.3, 0.4, wave_type="sine", freq_end=880)
+SOUND_PLACE_TOWER = generate_sound(1500, 0.1, 0.3, wave_type="sine", freq_end=2000)
+SOUND_GAME_OVER = generate_sound(220, 0.6, 0.5, wave_type="sawtooth", freq_end=80)
+SOUND_UPGRADE = generate_sound(1000, 0.15, 0.35, wave_type="sine", freq_end=2000)
+SOUND_ENEMY_REACH = generate_sound(100, 0.3, 0.5, wave_type="square", freq_end=40)
+
+
+# ============================================================
+# 字体
+# ============================================================
+def get_font(size, bold=False):
+    font_names = ["SimHei", "Microsoft YaHei", "SimSun", "Arial"]
+    for name in font_names:
+        try:
+            return pygame.font.SysFont(name, size, bold=bold)
+        except Exception:
+            continue
+    return pygame.font.Font(None, size)
+
+
+FONT_SMALL = get_font(16)
+FONT_MEDIUM = get_font(20)
+FONT_LARGE = get_font(28, bold=True)
+FONT_TITLE = get_font(48, bold=True)
+FONT_TOWER = get_font(12)
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+def grid_to_pixel(col, row):
+    return col * GRID_SIZE + GRID_SIZE // 2, row * GRID_SIZE + GRID_SIZE // 2
+
+
+def pixel_to_grid(x, y):
+    col = x // GRID_SIZE
+    row = y // GRID_SIZE
+    if 0 <= col < GRID_COLS and 0 <= row < GRID_ROWS:
+        return col, row
+    return None, None
+
+
+def is_on_path(col, row):
+    for i in range(len(PATH_POINTS) - 1):
+        x1, y1 = PATH_POINTS[i]
+        x2, y2 = PATH_POINTS[i + 1]
+        if x1 == x2:  # 垂直
+            if col == x1 and min(y1, y2) <= row <= max(y1, y2):
+                return True
+        elif y1 == y2:  # 水平
+            if row == y1 and min(x1, x2) <= col <= max(x1, x2):
+                return True
+    return False
+
+
+def distance(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def get_path_rects():
+    """返回所有路径格子坐标集合"""
+    rects = set()
+    for i in range(len(PATH_POINTS) - 1):
+        x1, y1 = PATH_POINTS[i]
+        x2, y2 = PATH_POINTS[i + 1]
+        if x1 == x2:  # 垂直
+            for y in range(min(y1, y2), max(y1, y2) + 1):
+                rects.add((x1, y))
+        else:  # 水平
+            for x in range(min(x1, x2), max(x1, x2) + 1):
+                rects.add((x, y1))
+    return rects
+
+
+PATH_CELLS = get_path_rects()
+
+
+# ============================================================
+# 精灵缓存和缩放
+# ============================================================
+SCALED_SPRITES = {}
+
+def get_scaled_sprite(name, target_size):
+    """获取指定大小的缩放精灵，带缓存"""
+    key = (name, target_size)
+    if key in SCALED_SPRITES:
+        return SCALED_SPRITES[key]
+    sprite = ASSETS.get_sprite(name)
+    if sprite is None:
+        return None
+    orig_w, orig_h = sprite.get_size()
+    # 保持宽高比缩放
+    scale = target_size / max(orig_w, orig_h)
+    new_w = max(1, int(orig_w * scale))
+    new_h = max(1, int(orig_h * scale))
+    scaled = pygame.transform.smoothscale(sprite, (new_w, new_h))
+    SCALED_SPRITES[key] = scaled
+    return scaled
+
+
+def get_enemy_sprite(enemy_type, size=36):
+    """获取敌人精灵"""
+    sprite_index = {"normal": 0, "fast": 1, "tank": 2, "boss": 3}
+    idx = sprite_index.get(enemy_type, 0)
+    return get_scaled_sprite(f"enemy_{idx}", size)
+
+
+def get_tower_sprite(tower_type, level, size=38):
+    """获取防御塔精灵"""
+    sprite = get_scaled_sprite(f"tower_{tower_type}", size + level * 4)
+    return sprite
+
+
+# ============================================================
+# 子弹类
+# ============================================================
+class Projectile:
+    def __init__(self, x, y, target, damage, speed, color, effect="normal"):
+        self.x = x
+        self.y = y
+        self.target = target
+        self.damage = damage
+        self.speed = speed
+        self.color = color
+        self.effect = effect
+        self.alive = True
+        self.size = 5
+
+    def update(self):
+        if not self.target or not self.target.alive:
+            self.alive = False
+            return
+        tx, ty = self.target.x, self.target.y
+        dx, dy = tx - self.x, ty - self.y
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < self.speed + 5:
+            self.alive = False
+            self.target.take_damage(self.damage)
+            if self.effect == "ice":
+                self.target.slow(0.5, 60)
+            elif self.effect == "cannon":
+                self.target.slow(0.3, 15)
+            SOUND_HIT.play()
+            return
+        self.x += (dx / dist) * self.speed
+        self.y += (dy / dist) * self.speed
+
+    def draw(self, screen):
+        pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), self.size)
+        glow = pygame.Surface((self.size * 4, self.size * 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (*self.color, 80), (self.size * 2, self.size * 2), self.size * 2)
+        screen.blit(glow, (int(self.x) - self.size * 2, int(self.y) - self.size * 2))
+
+
+# ============================================================
+# 防御塔类
+# ============================================================
+class Tower:
+    TOWER_TYPES = {
+        "archer": {
+            "name": "箭塔",
+            "cost": 50, "range": 120, "damage": 15, "cooldown": 30,
+            "color": COLOR_GREEN, "bullet_color": COLOR_GREEN,
+            "bullet_speed": 10, "effect": "normal",
+            "upgrade_cost": 40, "upgrade_damage": 10, "upgrade_range": 15,
+            "level_name": {1: "箭塔", 2: "强弓塔", 3: "神射塔"}
+        },
+        "cannon": {
+            "name": "炮塔",
+            "cost": 100, "range": 100, "damage": 50, "cooldown": 50,
+            "color": COLOR_ORANGE, "bullet_color": COLOR_ORANGE,
+            "bullet_speed": 7, "effect": "cannon",
+            "upgrade_cost": 80, "upgrade_damage": 25, "upgrade_range": 10,
+            "level_name": {1: "炮塔", 2: "加农炮", 3: "毁灭者"}
+        },
+        "ice": {
+            "name": "冰塔",
+            "cost": 75, "range": 110, "damage": 8, "cooldown": 25,
+            "color": COLOR_ICE, "bullet_color": COLOR_ICE,
+            "bullet_speed": 9, "effect": "ice",
+            "upgrade_cost": 60, "upgrade_damage": 5, "upgrade_range": 15,
+            "level_name": {1: "冰塔", 2: "寒冰塔", 3: "极冻塔"}
+        },
+        "magic": {
+            "name": "魔法塔",
+            "cost": 150, "range": 140, "damage": 35, "cooldown": 40,
+            "color": COLOR_PURPLE, "bullet_color": COLOR_PURPLE,
+            "bullet_speed": 8, "effect": "magic",
+            "upgrade_cost": 120, "upgrade_damage": 20, "upgrade_range": 20,
+            "level_name": {1: "魔法塔", 2: "奥术塔", 3: "大法师塔"}
+        }
+    }
+
+    def __init__(self, col, row, tower_type):
+        self.col = col
+        self.row = row
+        self.x, self.y = grid_to_pixel(col, row)
+        self.type = tower_type
+        self.level = 1
+        self.max_level = 3
+
+        info = self.TOWER_TYPES[tower_type]
+        self.name = info["name"]
+        self.cost = info["cost"]
+        self.range = info["range"]
+        self.damage = info["damage"]
+        self.cooldown = info["cooldown"]
+        self.color = info["color"]
+        self.bullet_color = info["bullet_color"]
+        self.bullet_speed = info["bullet_speed"]
+        self.effect = info["effect"]
+        self.upgrade_cost = info["upgrade_cost"]
+        self.upgrade_damage = info["upgrade_damage"]
+        self.upgrade_range = info["upgrade_range"]
+        self.level_name = info["level_name"]
+
+        self.cooldown_timer = 0
+        self.target = None
+        self.angle = 0
+
+        # 动画
+        self.float_offset = random.uniform(0, 2 * math.pi)
+
+    def get_upgrade_cost(self):
+        return self.upgrade_cost * self.level
+
+    def get_sell_value(self):
+        total = self.cost
+        for lv in range(2, self.level + 1):
+            total += self.upgrade_cost * (lv - 1)
+        return total // 2
+
+    def upgrade(self):
+        if self.level >= self.max_level:
+            return False
+        self.level += 1
+        self.damage += self.upgrade_damage
+        self.range += self.upgrade_range
+        self.cooldown = max(10, self.cooldown - 3)
+        self.name = self.level_name[self.level]
+        return True
+
+    def find_target(self, enemies):
+        self.target = None
+        best_progress = -1
+        for enemy in enemies:
+            if not enemy.alive:
+                continue
+            d = distance((self.x, self.y), (enemy.x, enemy.y))
+            if d <= self.range:
+                if enemy.path_progress > best_progress:
+                    best_progress = enemy.path_progress
+                    self.target = enemy
+        if self.target:
+            self.angle = math.degrees(math.atan2(
+                self.target.y - self.y, self.target.x - self.x))
+
+    def shoot(self):
+        if not self.target or self.cooldown_timer > 0:
+            return None
+        if distance((self.x, self.y), (self.target.x, self.target.y)) > self.range:
+            return None
+        self.cooldown_timer = self.cooldown
+        return Projectile(self.x, self.y, self.target, self.damage,
+                          self.bullet_speed, self.bullet_color, self.effect)
+
+    def update(self, enemies):
+        if self.cooldown_timer > 0:
+            self.cooldown_timer -= 1
+        if not self.target or not self.target.alive:
+            self.find_target(enemies)
+        self.float_offset += 0.02
+
+    def draw_range(self, screen):
+        surface = pygame.Surface((self.range * 2, self.range * 2), pygame.SRCALPHA)
+        pygame.draw.circle(surface, (*self.color, 30), (self.range, self.range), self.range)
+        pygame.draw.circle(surface, (*self.color, 80), (self.range, self.range), self.range, 2)
+        screen.blit(surface, (self.x - self.range, self.y - self.range))
+
+    def draw(self, screen, frame=0):
+        cx, cy = self.x, self.y
+
+        # 绘制精灵图
+        sprite = get_tower_sprite(self.type, self.level, size=32 + self.level * 3)
+        if sprite:
+            # 悬浮动画
+            float_y = math.sin(self.float_offset) * 2
+            sprite_rect = sprite.get_rect(center=(cx, cy - 5 + float_y))
+            screen.blit(sprite, sprite_rect)
+        else:
+            # 降级绘制：简单几何图形
+            size = GRID_SIZE // 2 - 4
+            pygame.draw.rect(screen, COLOR_PATH,
+                             (cx - size, cy - size, size * 2, size * 2), border_radius=5)
+            pygame.draw.rect(screen, (80, 80, 80),
+                             (cx - size, cy - size, size * 2, size * 2), 2, border_radius=5)
+
+        # 等级标记
+        if self.level > 1:
+            lv_bg = pygame.Surface((16, 16), pygame.SRCALPHA)
+            pygame.draw.circle(lv_bg, COLOR_GOLD, (8, 8), 8)
+            screen.blit(lv_bg, (cx + 8, cy - 18))
+            lv_text = FONT_TOWER.render(str(self.level), True, COLOR_BLACK)
+            screen.blit(lv_text, (cx + 8 + 4, cy - 18 + 2))
+
+
+# ============================================================
+# 敌人类
+# ============================================================
+class Enemy:
+    ENEMY_TYPES = {
+        "normal": {"name": "普通怪", "hp": 100, "speed": 1.5, "reward": 15, "color": COLOR_RED, "size": 12},
+        "fast": {"name": "快速怪", "hp": 60, "speed": 3.0, "reward": 20, "color": (255, 200, 50), "size": 10},
+        "tank": {"name": "坦克怪", "hp": 300, "speed": 1.0, "reward": 30, "color": (100, 100, 100), "size": 16},
+        "boss": {"name": "BOSS", "hp": 1000, "speed": 0.8, "reward": 100, "color": (200, 50, 200), "size": 20},
+    }
+
+    def __init__(self, enemy_type, hp_multiplier=1.0):
+        info = self.ENEMY_TYPES[enemy_type]
+        self.type = enemy_type
+        self.name = info["name"]
+        self.max_hp = int(info["hp"] * hp_multiplier)
+        self.hp = self.max_hp
+        self.base_speed = info["speed"]
+        self.speed = self.base_speed
+        self.reward = info["reward"]
+        self.color = info["color"]
+        self.base_size = info["size"]
+
+        self.alive = True
+        self.reached_end = False
+        self.path_index = 0
+        self.path_progress = 0.0
+        self.x, self.y = grid_to_pixel(*PATH_POINTS[0])
+        self.slow_timer = 0
+        self.slow_factor = 1.0
+
+        # 动画
+        self.anim_frame = 0
+        self.anim_timer = 0
+        self.facing_right = True
+        self.bob_offset = random.uniform(0, 2 * math.pi)
+
+    def slow(self, factor, duration):
+        if factor < self.slow_factor:
+            self.slow_factor = factor
+            self.slow_timer = duration
+            self.speed = self.base_speed * self.slow_factor
+
+    def update(self):
+        if not self.alive:
+            return False
+
+        if self.slow_timer > 0:
+            self.slow_timer -= 1
+            self.speed = self.base_speed * self.slow_factor
+            if self.slow_timer == 0:
+                self.speed = self.base_speed
+                self.slow_factor = 1.0
+
+        if self.path_index >= len(PATH_POINTS) - 1:
+            self.reached_end = True
+            self.alive = False
+            return True
+
+        tx, ty = grid_to_pixel(*PATH_POINTS[self.path_index + 1])
+        dx, dy = tx - self.x, ty - self.y
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < self.speed + 1:
+            self.path_index += 1
+            self.x, self.y = tx, ty
+            self.path_progress = self.path_index
+        else:
+            self.x += (dx / dist) * self.speed
+            self.y += (dy / dist) * self.speed
+            # 朝向
+            if dx > 0:
+                self.facing_right = True
+            elif dx < 0:
+                self.facing_right = False
+            # 路径进度
+            segment_start = self.path_index
+            sx, sy = grid_to_pixel(*PATH_POINTS[segment_start])
+            ex, ey = grid_to_pixel(*PATH_POINTS[segment_start + 1])
+            seg_total = distance((sx, sy), (ex, ey))
+            seg_done = seg_total - dist
+            self.path_progress = segment_start + seg_done / max(seg_total, 1)
+
+        # 行走动画
+        self.anim_timer += 1
+        self.bob_offset += 0.15
+        if self.anim_timer > 8:
+            self.anim_timer = 0
+            self.anim_frame = (self.anim_frame + 1) % 4
+
+        return False
+
+    def take_damage(self, damage):
+        self.hp -= damage
+        if self.hp <= 0:
+            self.hp = 0
+            self.alive = False
+            SOUND_DEATH.play()
+            return True
+        return False
+
+    def draw(self, screen):
+        if not self.alive:
+            return
+        cx, cy = int(self.x), int(self.y)
+
+        # 获取精灵图
+        display_size = self.base_size * 2.5
+        if self.type == "boss":
+            display_size = self.base_size * 3.5
+        sprite = get_enemy_sprite(self.type, size=int(display_size * 2.5))
+
+        if sprite:
+            # 翻转朝向
+            if not self.facing_right:
+                sprite = pygame.transform.flip(sprite, True, False)
+            # 行走时上下晃动
+            bob_y = math.sin(self.bob_offset) * 2
+            sprite_rect = sprite.get_rect(center=(cx, cy + bob_y))
+            screen.blit(sprite, sprite_rect)
+        else:
+            # 降级绘制
+            pygame.draw.circle(screen, self.color, (cx, cy), self.base_size)
+            pygame.draw.circle(screen, COLOR_BLACK, (cx, cy), self.base_size, 2)
+
+        # 冰霜效果
+        if self.slow_timer > 0 and self.slow_factor < 0.7:
+            ice_overlay = pygame.Surface((self.base_size * 3, self.base_size * 3), pygame.SRCALPHA)
+            pygame.draw.circle(ice_overlay, (100, 200, 255, 100),
+                               (self.base_size * 1.5, self.base_size * 1.5), self.base_size)
+            screen.blit(ice_overlay, (cx - self.base_size * 1.5, cy - self.base_size * 1.5))
+
+        # 血条
+        bar_width = self.base_size * 2 + 10
+        bar_height = 5
+        bar_x = cx - bar_width // 2
+        bar_y = cy - self.base_size - 12
+        hp_ratio = self.hp / self.max_hp
+        pygame.draw.rect(screen, (40, 10, 10), (bar_x, bar_y, bar_width, bar_height))
+        hp_color = COLOR_GREEN if hp_ratio > 0.5 else (COLOR_ORANGE if hp_ratio > 0.25 else COLOR_RED)
+        pygame.draw.rect(screen, hp_color,
+                         (bar_x, bar_y, int(bar_width * hp_ratio), bar_height))
+        pygame.draw.rect(screen, COLOR_BLACK, (bar_x, bar_y, bar_width, bar_height), 1)
+
+
+# ============================================================
+# 按钮类
+# ============================================================
+class Button:
+    def __init__(self, x, y, width, height, text, color=COLOR_BUTTON,
+                 hover_color=COLOR_BUTTON_HOVER, text_color=COLOR_WHITE,
+                 font=None):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.text = text
+        self.color = color
+        self.hover_color = hover_color
+        self.text_color = text_color
+        self.font = font or FONT_MEDIUM
+        self.hovered = False
+        self.enabled = True
+
+    def update(self, mouse_pos):
+        self.hovered = self.rect.collidepoint(mouse_pos) and self.enabled
+
+    def is_clicked(self, mouse_pos, mouse_clicked):
+        return self.hovered and mouse_clicked and self.enabled
+
+    def draw(self, screen, color_override=None):
+        bg = color_override if color_override else (
+            self.hover_color if self.hovered else self.color)
+        if not self.enabled:
+            bg = (40, 45, 55)
+        pygame.draw.rect(screen, bg, self.rect, border_radius=8)
+        pygame.draw.rect(screen, (100, 110, 130), self.rect, 2, border_radius=8)
+        txt = self.font.render(self.text, True, self.text_color if self.enabled else (120, 120, 120))
+        txt_rect = txt.get_rect(center=self.rect.center)
+        screen.blit(txt, txt_rect)
+
+
+# ============================================================
+# 地图背景渲染
+# ============================================================
+class MapRenderer:
+    """预渲染地图背景纹理"""
+    def __init__(self):
+        self.bg_surface = None
+        self._needs_rebuild = True
+
+    def build(self):
+        if not self._needs_rebuild:
+            return self.bg_surface
+
+        self.bg_surface = pygame.Surface((MAP_WIDTH, MAP_HEIGHT))
+
+        # 纯色背景
+        self.bg_surface.fill(COLOR_BG)
+
+        # ======== 绘制路径 —— 简洁线条 ========
+        # 连续路径线
+        for i in range(len(PATH_POINTS) - 1):
+            px1, py1 = grid_to_pixel(*PATH_POINTS[i])
+            px2, py2 = grid_to_pixel(*PATH_POINTS[i + 1])
+            pygame.draw.line(self.bg_surface, (180, 170, 150),
+                             (px1, py1), (px2, py2), 20)
+
+        # 小方向箭头
+        for i in range(len(PATH_POINTS) - 1):
+            x1, y1 = PATH_POINTS[i]
+            x2, y2 = PATH_POINTS[i + 1]
+            px1, py1 = grid_to_pixel(x1, y1)
+            px2, py2 = grid_to_pixel(x2, y2)
+            mid_x, mid_y = (px1 + px2) // 2, (py1 + py2) // 2
+            dx, dy = px2 - px1, py2 - py1
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist > 0:
+                ux, uy = dx / dist, dy / dist
+                tip = (mid_x + ux * 6, mid_y + uy * 6)
+                left = (mid_x - ux * 4 - uy * 5, mid_y - uy * 4 + ux * 5)
+                right = (mid_x - ux * 4 + uy * 5, mid_y - uy * 4 - ux * 5)
+                pygame.draw.polygon(self.bg_surface, (120, 110, 100),
+                                    [tip, left, right])
+
+        # 起点 "S"
+        sx, sy = grid_to_pixel(*PATH_POINTS[0])
+        font_small = pygame.font.SysFont("simhei", 16, bold=True)
+        label = font_small.render("起点", True, (0, 130, 0))
+        self.bg_surface.blit(label, (sx - 16, sy - 24))
+
+        # 终点 "E"
+        ex, ey = grid_to_pixel(*PATH_POINTS[-1])
+        label = font_small.render("终点", True, (200, 30, 30))
+        self.bg_surface.blit(label, (ex - 16, ey - 24))
+
+        self._needs_rebuild = False
+        return self.bg_surface
+
+
+MAP_RENDERER = MapRenderer()
+
+
+# ============================================================
+# 主游戏类
+# ============================================================
+class Game:
+    def __init__(self):
+        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        pygame.display.set_caption("塔防游戏 - Tower Defense")
+        self.clock = pygame.time.Clock()
+        self.running = True
+        self.state = "menu"
+
+        # 加载资源
+        ASSETS.load_all()
+        MAP_RENDERER._needs_rebuild = True
+
+        # 游戏数据
+        self.gold = 300
+        self.lives = 20
+        self.wave = 0
+        self.max_waves = 15
+        self.score = 0
+        self.towers = []
+        self.enemies = []
+        self.projectiles = []
+        self.selected_tower_type = None
+        self.selected_tower = None
+        self.show_range = False
+        self.wave_active = False
+        self.enemies_to_spawn = []
+        self.spawn_timer = 0
+        self.spawn_interval = 40
+        self.mouse_pos = (0, 0)
+        self.mouse_clicked = False
+        self.particles = []
+        self.init_ui()
+
+    def init_ui(self):
+        panel_x = MAP_WIDTH + 10
+        self.tower_buttons = []
+        types = [
+            ("archer", COLOR_GREEN),
+            ("cannon", COLOR_ORANGE),
+            ("ice", COLOR_ICE),
+            ("magic", COLOR_PURPLE),
+        ]
+        for i, (t_type, color) in enumerate(types):
+            info = Tower.TOWER_TYPES[t_type]
+            btn = Button(panel_x, 60 + i * 65, 200, 55,
+                         f"{info['name']}  ¥{info['cost']}",
+                         color=(50, 55, 65),
+                         hover_color=(70, 80, 100),
+                         font=FONT_MEDIUM)
+            btn.tower_type = t_type
+            self.tower_buttons.append(btn)
+
+        self.start_wave_btn = Button(panel_x, 340, 200, 45, "▶ 开始波次",
+                                     color=(50, 150, 80), hover_color=(70, 200, 100),
+                                     font=FONT_LARGE)
+        self.upgrade_btn = Button(panel_x, WINDOW_HEIGHT - 160, 200, 40,
+                                  "升级", color=(100, 70, 200),
+                                  hover_color=(130, 100, 230))
+        self.sell_btn = Button(panel_x, WINDOW_HEIGHT - 110, 200, 40,
+                               "出售", color=(200, 70, 70),
+                               hover_color=(240, 100, 100))
+        self.restart_btn = Button(panel_x, WINDOW_HEIGHT - 100, 200, 50,
+                                  "重新开始", color=(50, 150, 80),
+                                  hover_color=(70, 200, 100), font=FONT_LARGE)
+
+    def add_particles(self, x, y, color, count=8):
+        for _ in range(count):
+            angle = random.uniform(0, 2 * math.pi)
+            speed = random.uniform(2, 6)
+            life = random.randint(10, 25)
+            self.particles.append({
+                "x": x, "y": y,
+                "vx": math.cos(angle) * speed,
+                "vy": math.sin(angle) * speed,
+                "life": life, "max_life": life,
+                "color": color, "size": random.randint(2, 5)
+            })
+
+    def spawn_enemy(self, enemy_type, hp_mult=1.0):
+        self.enemies.append(Enemy(enemy_type, hp_mult))
+
+    def generate_wave(self):
+        self.wave += 1
+        self.enemies_to_spawn.clear()
+        hp_mult = 1.0 + (self.wave - 1) * 0.2
+
+        if self.wave == 1:
+            for _ in range(5): self.enemies_to_spawn.append(("normal", hp_mult))
+        elif self.wave == 2:
+            for _ in range(8): self.enemies_to_spawn.append(("normal", hp_mult))
+            self.enemies_to_spawn.append(("fast", hp_mult))
+        elif self.wave == 3:
+            for _ in range(6): self.enemies_to_spawn.append(("fast", hp_mult))
+            for _ in range(4): self.enemies_to_spawn.append(("normal", hp_mult))
+        elif self.wave == 4:
+            for _ in range(5): self.enemies_to_spawn.append(("tank", hp_mult))
+            for _ in range(3): self.enemies_to_spawn.append(("normal", hp_mult))
+        elif self.wave == 5:
+            self.enemies_to_spawn.append(("boss", hp_mult * 1.5))
+            for _ in range(5): self.enemies_to_spawn.append(("normal", hp_mult))
+        else:
+            count = 6 + self.wave
+            if self.wave % 5 == 0:
+                self.enemies_to_spawn.append(("boss", hp_mult * (1 + (self.wave // 5) * 0.5)))
+            for _ in range(count):
+                r = random.randint(1, 6)
+                if r <= 3:
+                    self.enemies_to_spawn.append(("normal", hp_mult))
+                elif r <= 5:
+                    self.enemies_to_spawn.append(("fast", hp_mult))
+                else:
+                    self.enemies_to_spawn.append(("tank", hp_mult))
+
+        random.shuffle(self.enemies_to_spawn)
+        self.spawn_timer = 60
+        self.spawn_interval = max(15, 40 - self.wave)
+        self.wave_active = True
+        SOUND_WAVE_START.play()
+
+    def start_new_wave(self):
+        if self.wave_active or len(self.enemies) > 0:
+            return
+        if self.wave >= self.max_waves:
+            return
+        self.generate_wave()
+
+    def place_tower(self, col, row, tower_type):
+        if not tower_type:
+            return False
+        info = Tower.TOWER_TYPES[tower_type]
+        if self.gold < info["cost"]:
+            return False
+        if is_on_path(col, row):
+            return False
+        for t in self.towers:
+            if t.col == col and t.row == row:
+                return False
+        tower = Tower(col, row, tower_type)
+        self.towers.append(tower)
+        self.gold -= info["cost"]
+        SOUND_PLACE_TOWER.play()
+        self.add_particles(tower.x, tower.y, tower.color, 12)
+        return True
+
+    def upgrade_tower(self, tower):
+        cost = tower.get_upgrade_cost()
+        if self.gold < cost:
+            return False
+        if not tower.upgrade():
+            return False
+        self.gold -= cost
+        SOUND_UPGRADE.play()
+        self.add_particles(tower.x, tower.y, COLOR_GOLD, 15)
+        return True
+
+    def sell_tower(self, tower):
+        value = tower.get_sell_value()
+        self.gold += value
+        self.towers.remove(tower)
+        self.add_particles(tower.x, tower.y, COLOR_GOLD, 10)
+        self.selected_tower = None
+
+    def handle_click(self):
+        mx, my = self.mouse_pos
+        if self.start_wave_btn.is_clicked((mx, my), self.mouse_clicked):
+            self.start_new_wave()
+        if self.restart_btn.is_clicked((mx, my), self.mouse_clicked):
+            self.__init__()
+            return
+        if self.selected_tower:
+            if self.upgrade_btn.is_clicked((mx, my), self.mouse_clicked):
+                self.upgrade_tower(self.selected_tower)
+                return
+            if self.sell_btn.is_clicked((mx, my), self.mouse_clicked):
+                self.sell_tower(self.selected_tower)
+                return
+        for btn in self.tower_buttons:
+            if btn.is_clicked((mx, my), self.mouse_clicked):
+                info = Tower.TOWER_TYPES[btn.tower_type]
+                if self.gold >= info["cost"]:
+                    self.selected_tower_type = btn.tower_type
+                    self.selected_tower = None
+                    self.show_range = True
+                return
+        if mx < MAP_WIDTH:
+            col, row = pixel_to_grid(mx, my)
+            if col is not None and row is not None:
+                clicked_tower = None
+                for tower in self.towers:
+                    if tower.col == col and tower.row == row:
+                        clicked_tower = tower
+                        break
+                if clicked_tower:
+                    self.selected_tower = clicked_tower
+                    self.selected_tower_type = None
+                    self.show_range = True
+                elif self.selected_tower_type:
+                    if self.place_tower(col, row, self.selected_tower_type):
+                        self.selected_tower_type = None
+                        self.show_range = False
+                else:
+                    self.selected_tower = None
+                    self.selected_tower_type = None
+                    self.show_range = False
+
+    def update(self):
+        if self.state != "playing":
+            return
+        for p in self.particles[:]:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["life"] -= 1
+            if p["life"] <= 0:
+                self.particles.remove(p)
+        if self.wave_active and self.enemies_to_spawn:
+            self.spawn_timer -= 1
+            if self.spawn_timer <= 0:
+                etype, hpm = self.enemies_to_spawn.pop(0)
+                self.spawn_enemy(etype, hpm)
+                self.spawn_timer = self.spawn_interval
+        if self.wave_active and not self.enemies_to_spawn and not self.enemies:
+            self.wave_active = False
+            wave_bonus = 50 + self.wave * 10
+            self.gold += wave_bonus
+            if self.wave >= self.max_waves:
+                self.state = "victory"
+        for enemy in self.enemies[:]:
+            reached = enemy.update()
+            if reached:
+                self.lives -= 1
+                SOUND_ENEMY_REACH.play()
+                self.add_particles(enemy.x, enemy.y, COLOR_RED, 15)
+                if self.lives <= 0:
+                    self.state = "game_over"
+                    SOUND_GAME_OVER.play()
+            elif not enemy.alive:
+                self.gold += enemy.reward
+                self.score += enemy.reward * 10
+                self.add_particles(enemy.x, enemy.y, enemy.color, 10)
+                self.enemies.remove(enemy)
+        for tower in self.towers:
+            tower.update(self.enemies)
+            proj = tower.shoot()
+            if proj:
+                self.projectiles.append(proj)
+                if tower.type == "archer": SOUND_SHOOT_ARROW.play()
+                elif tower.type == "cannon": SOUND_SHOOT_CANNON.play()
+                elif tower.type == "ice": SOUND_SHOOT_ICE.play()
+                elif tower.type == "magic": SOUND_SHOOT_MAGIC.play()
+        for tower in self.towers:
+            if tower.type == "magic" and tower.target and tower.cooldown_timer == tower.cooldown - 1:
+                for enemy in self.enemies:
+                    if enemy.alive and distance((tower.x, tower.y), (enemy.x, enemy.y)) <= tower.range * 0.6:
+                        enemy.take_damage(tower.damage // 3)
+        for proj in self.projectiles[:]:
+            proj.update()
+            if not proj.alive:
+                self.projectiles.remove(proj)
+        for btn in self.tower_buttons:
+            btn.enabled = (self.gold >= Tower.TOWER_TYPES[btn.tower_type]["cost"])
+            btn.update(self.mouse_pos)
+        self.start_wave_btn.enabled = (not self.wave_active and len(self.enemies) == 0)
+        self.start_wave_btn.update(self.mouse_pos)
+        if self.selected_tower:
+            if self.selected_tower.level < self.selected_tower.max_level:
+                self.upgrade_btn.enabled = self.gold >= self.selected_tower.get_upgrade_cost()
+            else:
+                self.upgrade_btn.enabled = False
+                self.upgrade_btn.text = "已满级"
+            self.sell_btn.text = f"出售 ¥{self.selected_tower.get_sell_value()}"
+            self.sell_btn.enabled = True
+            self.upgrade_btn.update(self.mouse_pos)
+            self.sell_btn.update(self.mouse_pos)
+        else:
+            self.upgrade_btn.text = "升级"
+            self.sell_btn.text = "出售"
+        self.restart_btn.update(self.mouse_pos)
+
+    def draw_map(self):
+        bg = MAP_RENDERER.build()
+        self.screen.blit(bg, (0, 0))
+        # 网格线（半透明）
+        for col in range(GRID_COLS):
+            for row in range(GRID_ROWS):
+                rect = pygame.Rect(col * GRID_SIZE, row * GRID_SIZE, GRID_SIZE, GRID_SIZE)
+                pygame.draw.rect(self.screen, (0, 0, 0, 20), rect, 1)
+
+    def draw_panel(self):
+        panel_x = MAP_WIDTH
+        pygame.draw.rect(self.screen, COLOR_PANEL_BG,
+                         (panel_x, 0, PANEL_WIDTH, WINDOW_HEIGHT))
+        pygame.draw.line(self.screen, (60, 65, 75),
+                         (panel_x, 0), (panel_x, WINDOW_HEIGHT), 2)
+        y = 10
+        gold_surface = pygame.Surface((26, 26), pygame.SRCALPHA)
+        pygame.draw.circle(gold_surface, COLOR_GOLD, (13, 13), 12)
+        pygame.draw.circle(gold_surface, COLOR_BLACK, (13, 13), 12, 2)
+        self.screen.blit(gold_surface, (panel_x + 10, y))
+        gold_text = FONT_LARGE.render(f"¥ {self.gold}", True, COLOR_GOLD)
+        self.screen.blit(gold_text, (panel_x + 42, y + 2))
+        y += 32
+        heart_surface = pygame.Surface((24, 24), pygame.SRCALPHA)
+        pts = [(12, 8), (6, 2), (2, 6), (2, 13), (12, 22), (22, 13), (22, 6), (18, 2)]
+        pygame.draw.polygon(heart_surface, COLOR_HEART, pts)
+        self.screen.blit(heart_surface, (panel_x + 10, y))
+        lives_text = FONT_LARGE.render(str(self.lives), True, COLOR_HEART)
+        self.screen.blit(lives_text, (panel_x + 42, y + 2))
+        y += 32
+        wave_text = FONT_MEDIUM.render(f"波次: {self.wave}/{self.max_waves}", True, COLOR_WHITE)
+        self.screen.blit(wave_text, (panel_x + 10, y + 2))
+        score_text = FONT_SMALL.render(f"得分: {self.score}", True, COLOR_WHITE)
+        self.screen.blit(score_text, (panel_x + 10, y + 26))
+        y += 60
+        total_enemies = len(self.enemies) + len(self.enemies_to_spawn)
+        if self.wave_active and total_enemies > 0:
+            remaining = len(self.enemies) + len(self.enemies_to_spawn)
+            bar_w = 200
+            bar_h = 10
+            progress = 1.0 - remaining / max(total_enemies, 1)
+            pygame.draw.rect(self.screen, COLOR_WAVE_BAR_BG,
+                             (panel_x + 10, y, bar_w, bar_h), border_radius=5)
+            pygame.draw.rect(self.screen, COLOR_GREEN,
+                             (panel_x + 10, y, int(bar_w * progress), bar_h),
+                             border_radius=5)
+        panel_title = FONT_MEDIUM.render("—— 防御塔 ——", True, COLOR_WHITE)
+        panel_title_rect = panel_title.get_rect(center=(panel_x + PANEL_WIDTH // 2, 340))
+        self.screen.blit(panel_title, panel_title_rect)
+        for btn in self.tower_buttons:
+            btn.draw(self.screen)
+            if hasattr(btn, 'tower_type'):
+                sprite = get_tower_sprite(btn.tower_type, 1, size=26)
+                if sprite:
+                    icon_rect = sprite.get_rect(center=(btn.rect.x + 25, btn.rect.y + btn.rect.height // 2))
+                    self.screen.blit(sprite, icon_rect)
+        self.start_wave_btn.draw(self.screen)
+        y_info = 400
+        if self.selected_tower:
+            t = self.selected_tower
+            separator_y = y_info
+            pygame.draw.line(self.screen, (60, 65, 75),
+                             (panel_x + 5, separator_y),
+                             (panel_x + PANEL_WIDTH - 5, separator_y), 1)
+            sprite = get_tower_sprite(t.type, t.level, size=40)
+            if sprite:
+                self.screen.blit(sprite, sprite.get_rect(center=(panel_x + PANEL_WIDTH // 2, y_info + 25)))
+            info_lines = [
+                f"名称: {t.name}",
+                f"等级: {t.level}/{t.max_level}",
+                f"伤害: {t.damage}",
+                f"射程: {t.range}",
+                f"攻速: {t.cooldown}帧",
+            ]
+            for i, line in enumerate(info_lines):
+                txt = FONT_SMALL.render(line, True, COLOR_WHITE)
+                self.screen.blit(txt, (panel_x + 10, y_info + 50 + i * 22))
+            upgrade_cost = t.get_upgrade_cost()
+            if t.level < t.max_level:
+                self.upgrade_btn.text = f"升级 ¥{upgrade_cost}"
+            else:
+                self.upgrade_btn.text = "已满级"
+            self.upgrade_btn.draw(self.screen)
+            self.sell_btn.draw(self.screen)
+        elif self.selected_tower_type:
+            info = Tower.TOWER_TYPES[self.selected_tower_type]
+            sprite = get_tower_sprite(self.selected_tower_type, 1, size=50)
+            if sprite:
+                self.screen.blit(sprite, sprite.get_rect(center=(panel_x + PANEL_WIDTH // 2, y_info + 25)))
+            txt = FONT_SMALL.render(f"已选择: {info['name']}", True, COLOR_WHITE)
+            self.screen.blit(txt, (panel_x + 10, y_info + 55))
+            txt = FONT_SMALL.render("点击地图放置", True, (180, 180, 180))
+            self.screen.blit(txt, (panel_x + 10, y_info + 77))
+        if self.state in ("game_over", "victory"):
+            self.restart_btn.draw(self.screen)
+
+    def draw_gameplay(self):
+        self.draw_map()
+        if self.show_range and self.selected_tower:
+            self.selected_tower.draw_range(self.screen)
+        if self.selected_tower_type and self.mouse_pos[0] < MAP_WIDTH:
+            col, row = pixel_to_grid(*self.mouse_pos)
+            if col is not None and row is not None and not is_on_path(col, row):
+                info = Tower.TOWER_TYPES[self.selected_tower_type]
+                cx, cy = grid_to_pixel(col, row)
+                surface = pygame.Surface((info["range"] * 2, info["range"] * 2), pygame.SRCALPHA)
+                pygame.draw.circle(surface, (*info["color"], 25),
+                                   (info["range"], info["range"]), info["range"])
+                self.screen.blit(surface, (cx - info["range"], cy - info["range"]))
+                sprite = get_tower_sprite(self.selected_tower_type, 1, size=32)
+                if sprite:
+                    s = pygame.Surface(sprite.get_size(), pygame.SRCALPHA)
+                    s.blit(sprite, (0, 0))
+                    s.set_alpha(150)
+                    self.screen.blit(s, sprite.get_rect(center=(cx, cy)))
+        for tower in self.towers:
+            tower.draw(self.screen)
+        for enemy in self.enemies:
+            enemy.draw(self.screen)
+        for proj in self.projectiles:
+            proj.draw(self.screen)
+        for p in self.particles:
+            alpha = int(255 * p["life"] / p["max_life"])
+            color = (*p["color"], alpha)
+            glow = pygame.Surface((p["size"] * 3, p["size"] * 3), pygame.SRCALPHA)
+            pygame.draw.circle(glow, color, (p["size"] * 1.5, p["size"] * 1.5), p["size"] * 1.5)
+            self.screen.blit(glow, (int(p["x"] - p["size"] * 1.5),
+                                    int(p["y"] - p["size"] * 1.5)))
+        pygame.draw.rect(self.screen, COLOR_WHITE, (0, 0, MAP_WIDTH, MAP_HEIGHT), 2)
+        self.draw_panel()
+
+    def draw_menu(self):
+        self.screen.fill(COLOR_BG)
+        # 草地背景装饰
+        grass = ASSETS.get_texture("grass")
+        if grass:
+            for y in range(0, WINDOW_HEIGHT, grass.get_height()):
+                for x in range(0, MAP_WIDTH, grass.get_width()):
+                    self.screen.blit(grass, (x, y))
+        title = FONT_TITLE.render("塔 防 游 戏", True, COLOR_GOLD)
+        title_rect = title.get_rect(center=(WINDOW_WIDTH // 2, 120))
+        self.screen.blit(title, title_rect)
+        subtitle = FONT_LARGE.render("Tower Defense", True, COLOR_WHITE)
+        sub_rect = subtitle.get_rect(center=(WINDOW_WIDTH // 2, 180))
+        self.screen.blit(subtitle, sub_rect)
+        # 显示敌人和塔的精灵图示例
+        enemy_names = [("normal", "普通怪"), ("fast", "快速怪"), ("tank", "坦克怪"), ("boss", "BOSS")]
+        tower_types = [("archer", "箭塔"), ("cannon", "炮塔"), ("ice", "冰塔"), ("magic", "魔法塔")]
+        y = 230
+        x_offset = 200
+        for i, (etype, ename) in enumerate(enemy_names):
+            sprite = get_enemy_sprite(etype, size=30)
+            if sprite:
+                self.screen.blit(sprite, sprite.get_rect(center=(x_offset + i * 120, y)))
+            txt = FONT_SMALL.render(ename, True, COLOR_WHITE)
+            self.screen.blit(txt, (x_offset + i * 120 - 20, y + 20))
+        y += 70
+        for i, (ttype, tname) in enumerate(tower_types):
+            sprite = get_tower_sprite(ttype, 1, size=30)
+            if sprite:
+                self.screen.blit(sprite, sprite.get_rect(center=(x_offset + i * 120, y)))
+            txt = FONT_SMALL.render(tname, True, COLOR_WHITE)
+            self.screen.blit(txt, (x_offset + i * 120 - 20, y + 20))
+        y += 70
+        ops = [
+            "操作: 选择塔 → 点击地图放置 → 开始波次",
+            "点击已放置的塔可升级或出售",
+            "P 暂停 | ESC 退出",
+        ]
+        for op in ops:
+            txt = FONT_SMALL.render(op, True, (180, 180, 180))
+            self.screen.blit(txt, (250, y))
+            y += 25
+        start_btn = Button(WINDOW_WIDTH // 2 - 120, y + 30, 240, 60,
+                           "开始游戏", color=(50, 150, 80),
+                           hover_color=(70, 200, 100), font=FONT_TITLE)
+        start_btn.update(self.mouse_pos)
+        start_btn.draw(self.screen)
+        self._start_btn = start_btn
+
+    def draw_game_over(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+        if self.state == "game_over":
+            title = FONT_TITLE.render("游 戏 结 束", True, COLOR_RED)
+        else:
+            title = FONT_TITLE.render("胜 利 !", True, COLOR_GOLD)
+        title_rect = title.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 50))
+        self.screen.blit(title, title_rect)
+        score_txt = FONT_LARGE.render(f"最终得分: {self.score}", True, COLOR_WHITE)
+        score_rect = score_txt.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 10))
+        self.screen.blit(score_txt, score_rect)
+        wave_txt = FONT_MEDIUM.render(f"到达波次: {self.wave}", True, COLOR_WHITE)
+        wave_rect = wave_txt.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 45))
+        self.screen.blit(wave_txt, wave_rect)
+        self.restart_btn.draw(self.screen)
+
+    def draw_pause_overlay(self):
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 150))
+        self.screen.blit(overlay, (0, 0))
+        pause_txt = FONT_TITLE.render("暂 停", True, COLOR_WHITE)
+        pause_rect = pause_txt.get_rect(center=(MAP_WIDTH // 2, MAP_HEIGHT // 2))
+        self.screen.blit(pause_txt, pause_rect)
+        tip_txt = FONT_MEDIUM.render("按 P 继续", True, COLOR_WHITE)
+        tip_rect = tip_txt.get_rect(center=(MAP_WIDTH // 2, MAP_HEIGHT // 2 + 45))
+        self.screen.blit(tip_txt, tip_rect)
+
+    def run(self):
+        while self.running:
+            self.mouse_clicked = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                    return
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.mouse_clicked = True
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        self.running = False
+                        return
+                    if event.key == pygame.K_p:
+                        if self.state == "playing":
+                            self.state = "paused"
+                        elif self.state == "paused":
+                            self.state = "playing"
+                    if event.key == pygame.K_SPACE and self.state == "playing":
+                        self.start_new_wave()
+            self.mouse_pos = pygame.mouse.get_pos()
+            if self.state == "menu":
+                self.draw_menu()
+                if hasattr(self, '_start_btn'):
+                    self._start_btn.update(self.mouse_pos)
+                    if self._start_btn.hovered and self.mouse_clicked:
+                        self.state = "playing"
+            elif self.state == "playing":
+                self.handle_click()
+                self.update()
+                self.draw_gameplay()
+            elif self.state == "paused":
+                self.draw_gameplay()
+                self.draw_pause_overlay()
+            elif self.state in ("game_over", "victory"):
+                self.draw_gameplay()
+                self.draw_game_over()
+                if self.restart_btn.is_clicked(self.mouse_pos, self.mouse_clicked):
+                    self.__init__()
+            pygame.display.flip()
+            self.clock.tick(FPS)
+        pygame.quit()
+        sys.exit()
+
+
+# ============================================================
+# 程序入口
+# ============================================================
+if __name__ == "__main__":
+    game = Game()
+    game.run()
